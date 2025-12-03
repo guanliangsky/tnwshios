@@ -22,7 +22,7 @@ struct Badge: Identifiable, Codable {
     }
 }
 
-enum BadgeCategory: String, CaseIterable {
+enum BadgeCategory: String, CaseIterable, Codable {
     case sobriety = "sobriety"
     case wellness = "wellness"
     case community = "community"
