@@ -1,5 +1,200 @@
 import SwiftUI
 import Foundation
+import Supabase
+import AuthenticationServices
+import UIKit
+
+// MARK: - Supabase Auth Setup
+
+struct SupabaseEnvironment {
+    static let shared = SupabaseEnvironment()
+    
+    let client: SupabaseClient
+    let redirectURL: URL
+    
+    private init() {
+        guard
+            let urlString = Bundle.main.object(forInfoDictionaryKey: "SUPABASE_URL") as? String,
+            let key = Bundle.main.object(forInfoDictionaryKey: "SUPABASE_ANON_KEY") as? String,
+            let url = URL(string: urlString)
+        else {
+            fatalError("Missing Supabase configuration in Info.plist")
+        }
+        
+        let redirect = URL(string: (Bundle.main.object(forInfoDictionaryKey: "SUPABASE_REDIRECT_URL") as? String) ?? "com.tnwsh.app://auth/callback") ?? URL(string: "com.tnwsh.app://auth/callback")!
+        redirectURL = redirect
+        
+        let options = SupabaseClientOptions(
+            auth: .init(
+                redirectToURL: redirect,
+                flowType: .pkce,
+                autoRefreshToken: true
+            )
+        )
+        client = SupabaseClient(supabaseURL: url, supabaseKey: key, options: options)
+    }
+}
+
+@MainActor
+final class AuthViewModel: ObservableObject {
+    @Published var session: Session?
+    @Published var email: String = ""
+    @Published var password: String = ""
+    @Published var isLoading: Bool = false
+    @Published var errorMessage: String?
+    
+    private let client = SupabaseEnvironment.shared.client
+    private let redirectURL = SupabaseEnvironment.shared.redirectURL
+    
+    func bootstrap() async {
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            session = try await client.auth.session
+        } catch {
+            session = nil
+        }
+    }
+    
+    func signUp() async {
+        await authenticate {
+            _ = try await client.auth.signUp(email: email, password: password)
+            session = try await client.auth.session
+        }
+    }
+    
+    func signIn() async {
+        await authenticate {
+            session = try await client.auth.signIn(email: email, password: password)
+        }
+    }
+    
+    func sendMagicLink() async {
+        await authenticate {
+            try await client.auth.signInWithOTP(email: email, redirectTo: redirectURL)
+        }
+    }
+    
+    func sendPasswordReset() async {
+        await authenticate {
+            try await client.auth.resetPasswordForEmail(email, redirectTo: redirectURL)
+        }
+    }
+    
+    func signInWithGoogle() async {
+        await authenticate {
+            if #available(iOS 16.0, *) {
+                session = try await client.auth.signInWithOAuth(
+                    provider: .google,
+                    redirectTo: redirectURL
+                )
+            } else {
+                let url = try client.auth.getOAuthSignInURL(provider: .google, redirectTo: redirectURL)
+                await openURL(url)
+            }
+        }
+    }
+    
+    func handle(url: URL) async {
+        guard url.absoluteString.starts(with: redirectURL.absoluteString) else { return }
+        await authenticate {
+            session = try await client.auth.session(from: url)
+        }
+    }
+    
+    func signOut() async {
+        await authenticate {
+            try await client.auth.signOut()
+            session = nil
+        }
+    }
+    
+    private func authenticate(_ work: () async throws -> Void) async {
+        isLoading = true
+        errorMessage = nil
+        do {
+            try await work()
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+        isLoading = false
+    }
+    
+    private func openURL(_ url: URL) async {
+        await MainActor.run {
+            UIApplication.shared.open(url)
+        }
+    }
+}
+
+struct AuthScreen: View {
+    @EnvironmentObject var auth: AuthViewModel
+    
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Welcome back")
+                .font(.title).bold()
+            
+            VStack(spacing: 12) {
+                TextField("Email", text: $auth.email)
+                    .textInputAutocapitalization(.none)
+                    .keyboardType(.emailAddress)
+                    .autocorrectionDisabled()
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(12)
+                
+                SecureField("Password", text: $auth.password)
+                    .padding()
+                    .background(Color(.secondarySystemBackground))
+                    .cornerRadius(12)
+            }
+            
+            if let error = auth.errorMessage {
+                Text(error)
+                    .foregroundColor(.red)
+                    .font(.footnote)
+                    .multilineTextAlignment(.center)
+            }
+            
+            if auth.isLoading {
+                ProgressView()
+            }
+            
+            VStack(spacing: 10) {
+                Button(action: { Task { await auth.signIn() } }) {
+                    Text("Sign In").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                
+                Button(action: { Task { await auth.signUp() } }) {
+                    Text("Create Account").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                
+                Button(action: { Task { await auth.sendPasswordReset() } }) {
+                    Text("Send Password Reset").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                
+                Button(action: { Task { await auth.sendMagicLink() } }) {
+                    Text("Send Magic Link").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                
+                Button(action: { Task { await auth.signInWithGoogle() } }) {
+                    HStack {
+                        Image(systemName: "globe")
+                        Text("Continue with Google").frame(maxWidth: .infinity, alignment: .center)
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.orange)
+            }
+        }
+        .padding()
+    }
+}
 
 // MARK: - Data Models
 
@@ -1591,9 +1786,56 @@ struct ContentView: View {
 
 @main
 struct SilenceHoldsApp: App {
+    @StateObject private var auth = AuthViewModel()
+    
     var body: some Scene {
         WindowGroup {
+            RootAuthContainer()
+                .environmentObject(auth)
+                .onOpenURL { url in
+                    Task {
+                        await auth.handle(url: url)
+                    }
+                }
+        }
+    }
+}
+
+struct RootAuthContainer: View {
+    @EnvironmentObject var auth: AuthViewModel
+    
+    var body: some View {
+        Group {
+            if auth.isLoading {
+                ProgressView("Loading account...")
+            } else if auth.session != nil {
+                SignedInContainer()
+            } else {
+                AuthScreen()
+            }
+        }
+        .task {
+            await auth.bootstrap()
+        }
+    }
+}
+
+struct SignedInContainer: View {
+    @EnvironmentObject var auth: AuthViewModel
+    
+    var body: some View {
+        ZStack(alignment: .topTrailing) {
             ContentView()
+            Button {
+                Task { await auth.signOut() }
+            } label: {
+                Text("Sign Out")
+                    .font(.caption)
+                    .padding(10)
+                    .background(.thinMaterial)
+                    .cornerRadius(12)
+            }
+            .padding()
         }
     }
 }
